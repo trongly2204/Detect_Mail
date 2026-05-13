@@ -1,134 +1,122 @@
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-
-import resource
 import joblib
 import pandas as pd
-import numpy as np
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect, url_for, session
 from flask_cors import CORS
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 import os
-import hashlib
-
-# Raise the open-file-descriptor limit to 4096 (macOS default is 256)
-_hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, _hard), _hard))
 
 app = Flask(__name__)
+app.secret_key = os.urandom(32)
 CORS(app)
 
-model_detect_anomaly = joblib.load('anomaly_model.pkl')
-model_detect_type_anomaly = joblib.load('anomaly_type_model.pkl')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-PASSWORD_FILE = "password.hash"
+MODEL_PATH = os.path.abspath(
+    os.path.join(BASE_DIR, '../../ml-service/spam_gmail.pkl')
+)
+model_detect_email = joblib.load(MODEL_PATH)
 
-def hash_password(p: str) -> str:
-    return hashlib.sha256(p.encode()).hexdigest()
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'credentials.json')
+
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly'
+]
+
+REDIRECT_URI = 'http://127.0.0.1:8000/oauth2callback'
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message: The API is running!"})
+@app.route('/')
+def index():
+    return '<a href="/login">Login with Google</a>'
 
-@app.route("/detect_anomaly", methods=["POST"])
-def detect_anomaly():
+
+@app.route('/login')
+def login():
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+
+    session['state'] = state
+    session['code_verifier'] = flow.code_verifier
+
+    return redirect(authorization_url)
+
+
+@app.route('/oauth2callback')
+def oauth2callback():
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        state=session['state'],
+        redirect_uri=REDIRECT_URI
+    )
+    flow.code_verifier = session['code_verifier']
+
+    flow.fetch_token(authorization_response=request.url)
+
+    creds = flow.credentials
+
+    session['credentials'] = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': list(creds.scopes)
+    }
+
+    return redirect(url_for('emails'))
+
+
+@app.route('/emails')
+def emails():
+    creds_data = session.get('credentials')
+
+    if not creds_data:
+        return redirect(url_for('login'))
+
+    creds = Credentials(**creds_data)
+
+    service = build('gmail', 'v1', credentials=creds)
+
+    results = service.users().messages().list(
+        userId='me',
+        maxResults=10
+    ).execute()
+
+    messages = results.get('messages', [])
+
+    output = '<h1>Recent Emails</h1>'
+    for msg in messages:
+        output += f'<p>{msg["id"]}</p>'
+
+    return output
+
+
+@app.route("/detect_email", methods=["POST"])
+def detect_email():
     try:
         data = request.json
         input_convert = pd.DataFrame(data)
-        predictions = model_detect_anomaly.predict(input_convert)
+        predictions = model_detect_email.predict(input_convert)
         return jsonify({"status": "Success",
                         "predictions": [int(p) for p in predictions]})
     except Exception as e:
         return jsonify({"status": "Error",
-                       "message": str(e)}), 400
-    
-
-ATTACK_LABEL = {
-    0: "Normal Communication",
-    1: "DDoS Attack",
-    2: "Malware Infection",
-    3: "Anomaly/Unusual Behavior",
-}
-
-# snake_case keys from server.js → Title Case keys the model was trained with
-_COL_MAP = {
-    "packet_size":               "Packet Size",
-    "transmission_rate":         "Transmission Rate",
-    "signal_strength":           "Signal Strength",
-    "error_rate":                "Error Rate",
-    "response_time":             "Response Time",
-    "battery_level":             "Battery Level",
-    "packet_loss_rate":          "Packet Loss Rate",
-    "connection_duration":       "Connection Duration",
-    "round_trip_time":           "Round Trip Time",
-    "hop_count":                 "Hop Count",
-    "jitter":                    "Jitter",
-    "drone_velocity":            "Drone Velocity",
-    "signal_to_noise_ratio":     "Signal-to-Noise Ratio",
-    "data_throughput":           "Data Throughput",
-    "communication_interval":    "Communication Interval",
-    "control_command_frequency": "Control Command Frequency",
-    "drone_altitude":            "Drone Altitude",
-    "cpu_usage":                 "CPU Usage",
-    "memory_utilization":        "Memory Utilization",
-    "distance_to_base_station":  "Distance to Base Station",
-    "protocol_type":             "Protocol Type",
-    "payload_type":              "Payload Type",
-    "encryption_status":         "Encryption Status",
-}
-
-@app.route("/detect_type_anomaly", methods=["POST"])
-def detect_type_anomaly():
-    try:
-        data = request.json
-        input_convert = pd.DataFrame(data).rename(columns=_COL_MAP)
-        raws = model_detect_type_anomaly.predict(input_convert)
-        labels = [ATTACK_LABEL.get(int(r), "Unknown") for r in raws]
-        return jsonify({"status": "Success",
-                        "predictions": labels})
-    except Exception as e:
-        return jsonify({"status": "Error",
                         "message": str(e)}), 400
-    
-
-# ================= CHECK PASSWORD =================
-@app.route("/login", methods=["POST"])
-def login():
-    # Check if password file exists
-    if not os.path.exists(PASSWORD_FILE):
-        return jsonify({"error": "Password not set"}), 400
-
-    # Extract password string from JSON
-    password = request.json.get("password")
-    if not password:
-        return jsonify({"error": "Password missing"}), 400
-
-    hashed_input = hash_password(password)
-
-    with open(PASSWORD_FILE, "r") as f:
-        saved = f.read().strip()  # remove any extra whitespace/newline
-
-    if hashed_input == saved:
-        return jsonify({"status": "success"}), 200
-    else:
-        return jsonify({"status": "failed"}), 401
-
-            
-# ================= SET-UP PASSWORD =================
-@app.route("/set_up", methods=["POST"])
-def set_up():
-    if os.path.exists(PASSWORD_FILE):
-        return jsonify({"message": "Password already set"}), 403
-    password = request.json["password"]
-    hashed = hash_password(password)
-
-    with open(PASSWORD_FILE, "w") as f:
-        f.write(hashed)
-    return jsonify({"message": "Password created"})
-
 
 
 if __name__ == "__main__":
     app.run(port=8000, debug=True)
-
-    
